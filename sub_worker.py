@@ -176,23 +176,26 @@ def fetch_dual_subs_from_rpm(video_id, api_token, work_dir="."):
         if not sub_files:
             return None, None
 
-        best_si = {'path': None, 'lines': 0}
-        best_en = {'path': None, 'lines': 0}
-        best_other = {'path': None, 'lines': 0}
+        print(f"[{WORKER_ID}] 🔍 Analyzing {len(sub_files)} subtitle tracks from RPM...", flush=True)
+        si_candidates = []
+        other_candidates = []
 
         for sf in sub_files:
             url = f"{target_host}{sf.get('url')}"
-            name = sf.get('name', '').lower()
+            name = sf.get('name', 'Unnamed')
+            name_lower = name.lower()
             lang = sf.get('language', '').lower()
             ext = sf.get('extension', 'srt')
             tmp = os.path.join(work_dir, f"dual_sub_{uuid.uuid4().hex[:6]}.{ext}")
 
-            dl = requests.get(url, timeout=20)
-            if dl.status_code != 200:
+            try:
+                dl = requests.get(url, timeout=20)
+                if dl.status_code != 200:
+                    continue
+                with open(tmp, 'wb') as f:
+                    f.write(dl.content)
+            except Exception:
                 continue
-
-            with open(tmp, 'wb') as f:
-                f.write(dl.content)
 
             if not is_valid_sub_file(tmp):
                 if os.path.exists(tmp): os.remove(tmp)
@@ -204,43 +207,68 @@ def fetch_dual_subs_from_rpm(video_id, api_token, work_dir="."):
                 except Exception: sub_obj = pysubs2.load(tmp, encoding='latin-1')
 
                 lines = len(sub_obj.events)
-                if lines < MIN_SUB_LINE_THRESHOLD:
+
+                # --- 🟢 125-Line Threshold & Subtitle Scoring Logic ---
+                score = lines
+                if lines >= MIN_SUB_LINE_THRESHOLD:
+                    if any(x in name_lower for x in ['si', 'sinhala', 'සිංහල']) or lang == 'si':
+                        score += 200000
+                    elif any(x in name_lower for x in ['en', 'eng', 'english']) or lang == 'en':
+                        score += 100000
+                    elif any(x in name_lower for x in ['ja', 'jap', 'romaji']) or lang == 'ja':
+                        score -= 100000
+                    else:
+                        score += 10000  # Valid other language (e.g. French, Spanish, Track 1)
+                else:
+                    score -= 50000  # Penalize cracked/incomplete tracks
+
+                print(f"[{WORKER_ID}]    📄 Track '{name}' | Lang: {lang or 'N/A'} | Lines: {lines} | Score: {score}", flush=True)
+
+                if score <= 0:
                     if os.path.exists(tmp): os.remove(tmp)
                     continue
 
-                if any(x in name for x in ['si', 'sinhala', 'සිංහල']) or lang == 'si':
-                    if lines > best_si['lines']:
-                        if best_si['path'] and os.path.exists(best_si['path']):
-                            try: os.remove(best_si['path'])
-                            except Exception: pass
-                        best_si = {'path': tmp, 'lines': lines}
-                    else:
-                        if os.path.exists(tmp): os.remove(tmp)
-                elif any(x in name for x in ['en', 'eng', 'english']) or lang == 'en':
-                    if lines > best_en['lines']:
-                        if best_en['path'] and os.path.exists(best_en['path']):
-                            try: os.remove(best_en['path'])
-                            except Exception: pass
-                        best_en = {'path': tmp, 'lines': lines}
-                    else:
-                        if os.path.exists(tmp): os.remove(tmp)
+                track_info = {
+                    'path': tmp,
+                    'lines': lines,
+                    'score': score,
+                    'name': name,
+                    'lang': lang
+                }
+
+                if any(x in name_lower for x in ['si', 'sinhala', 'සිංහල']) or lang == 'si':
+                    si_candidates.append(track_info)
                 else:
-                    # Valid subtitle track in another language (French, Spanish, or unnamed Track 1)
-                    if lines > best_other['lines']:
-                        if best_other['path'] and os.path.exists(best_other['path']):
-                            try: os.remove(best_other['path'])
-                            except Exception: pass
-                        best_other = {'path': tmp, 'lines': lines}
-                    else:
-                        if os.path.exists(tmp): os.remove(tmp)
+                    other_candidates.append(track_info)
+
             except Exception:
                 if os.path.exists(tmp):
                     try: os.remove(tmp)
                     except Exception: pass
 
-        # Prioritize English, but use other available language track as translation source if English is not present
-        candidate_en_or_other = best_en['path'] if best_en['path'] else best_other['path']
-        return best_si['path'], candidate_en_or_other
+        winner_si_path = None
+        if si_candidates:
+            si_candidates.sort(key=lambda x: x['score'], reverse=True)
+            winner_si = si_candidates[0]
+            winner_si_path = winner_si['path']
+            print(f"[{WORKER_ID}] 🏆 WINNER SINHALA: '{winner_si['name']}' ({winner_si['lines']} lines, Score: {winner_si['score']})", flush=True)
+            for c in si_candidates[1:]:
+                if os.path.exists(c['path']):
+                    try: os.remove(c['path'])
+                    except Exception: pass
+
+        winner_cand_path = None
+        if other_candidates:
+            other_candidates.sort(key=lambda x: x['score'], reverse=True)
+            winner_cand = other_candidates[0]
+            winner_cand_path = winner_cand['path']
+            print(f"[{WORKER_ID}] 🏆 WINNER TRANSLATION SOURCE: '{winner_cand['name']}' ({winner_cand['lines']} lines, Score: {winner_cand['score']})", flush=True)
+            for c in other_candidates[1:]:
+                if os.path.exists(c['path']):
+                    try: os.remove(c['path'])
+                    except Exception: pass
+
+        return winner_si_path, winner_cand_path
     except Exception as e:
         print(f"[{WORKER_ID}] ❌ Error fetching dual RPM subs: {e}", flush=True)
         return None, None
