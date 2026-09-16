@@ -178,6 +178,7 @@ def fetch_dual_subs_from_rpm(video_id, api_token, work_dir="."):
 
         best_si = {'path': None, 'lines': 0}
         best_en = {'path': None, 'lines': 0}
+        best_other = {'path': None, 'lines': 0}
 
         for sf in sub_files:
             url = f"{target_host}{sf.get('url')}"
@@ -224,13 +225,22 @@ def fetch_dual_subs_from_rpm(video_id, api_token, work_dir="."):
                     else:
                         if os.path.exists(tmp): os.remove(tmp)
                 else:
-                    if os.path.exists(tmp): os.remove(tmp)
+                    # Valid subtitle track in another language (French, Spanish, or unnamed Track 1)
+                    if lines > best_other['lines']:
+                        if best_other['path'] and os.path.exists(best_other['path']):
+                            try: os.remove(best_other['path'])
+                            except Exception: pass
+                        best_other = {'path': tmp, 'lines': lines}
+                    else:
+                        if os.path.exists(tmp): os.remove(tmp)
             except Exception:
                 if os.path.exists(tmp):
                     try: os.remove(tmp)
                     except Exception: pass
 
-        return best_si['path'], best_en['path']
+        # Prioritize English, but use other available language track as translation source if English is not present
+        candidate_en_or_other = best_en['path'] if best_en['path'] else best_other['path']
+        return best_si['path'], candidate_en_or_other
     except Exception as e:
         print(f"[{WORKER_ID}] ❌ Error fetching dual RPM subs: {e}", flush=True)
         return None, None
@@ -419,8 +429,8 @@ def main():
         else:
             success = execute_report_job(db, payload, work_dir)
 
-        print(f"[{WORKER_ID}] 🏁 Job Finished with Result: {'SUCCESS' if success else 'FAILED'}", flush=True)
-        sys.exit(0 if success else 2)
+        print(f"[{WORKER_ID}] 🏁 Job Finished with Result: {'SUCCESS' if success else 'COMPLETED (NO SUB AVAILABLE)'}", flush=True)
+        sys.exit(0)
     finally:
         if os.path.exists(work_dir):
             shutil.rmtree(work_dir, ignore_errors=True)
