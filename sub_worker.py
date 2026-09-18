@@ -302,10 +302,19 @@ def execute_report_job(db, payload, work_dir):
     anime_id = series_ref.id if series_ref else data.get('anilist_id', 0)
     ep_num = data.get('episodeNumber', 1)
 
+    job_id = payload.get("job_id") or f"report_{payload.get('doc_id')}"
     sub_file = download_rpm_sub_api(rpm_id, api_token=token, work_dir=work_dir)
     if not sub_file:
         print(f"[{WORKER_ID}] ⚠️ No valid subtitle file in video {rpm_id}", flush=True)
-        ep_ref.update({'report_status': 'failed_no_sub_in_video'})
+        ep_ref.update({'report_status': 'failed_no_sub_in_video', 'worker_id': None})
+        try:
+            rtdb.reference(f"sub_manager_jobs/completed_jobs/{job_id}").set({
+                "status": "completed",
+                "result": "failed_no_sub_in_video",
+                "ep_path": ep_path,
+                "timestamp": int(time.time() * 1000)
+            })
+        except Exception: pass
         return False
 
     rel_ctx = {}
@@ -334,9 +343,25 @@ def execute_report_job(db, payload, work_dir):
         })
         clear_missing_sub_alert(rtdb, anime_id, ep_num)
         print(f"[{WORKER_ID}] ✅ SUCCESS! Report Fixed. SI: {github_si} | EN: {github_en}", flush=True)
+        try:
+            rtdb.reference(f"sub_manager_jobs/completed_jobs/{job_id}").set({
+                "status": "completed",
+                "result": "fixed",
+                "ep_path": ep_path,
+                "timestamp": int(time.time() * 1000)
+            })
+        except Exception: pass
         return True
     else:
         ep_ref.update({'report_status': 'failed_translation_or_empty', 'worker_id': None})
+        try:
+            rtdb.reference(f"sub_manager_jobs/completed_jobs/{job_id}").set({
+                "status": "completed",
+                "result": "failed_translation",
+                "ep_path": ep_path,
+                "timestamp": int(time.time() * 1000)
+            })
+        except Exception: pass
         return False
 
 def execute_hunt_job(db, payload, work_dir):
@@ -409,6 +434,7 @@ def execute_hunt_job(db, payload, work_dir):
         delete_existing_sinhala_subs(rpm_id, token)
         upload_sub_to_rpm(rpm_id, target_si, token, remote_url=final_si_url)
 
+    job_id = payload.get("job_id") or f"hunt_{payload.get('doc_id')}"
     updates = {'last_auto_update': firestore.SERVER_TIMESTAMP}
     if final_si_url:
         updates['subtitles.sinhala'] = final_si_url
@@ -416,14 +442,24 @@ def execute_hunt_job(db, payload, work_dir):
         clear_missing_sub_alert(rtdb, anime_id, ep_num)
         print(f"[{WORKER_ID}] ✅ Hunt SUCCESS! Sinhala Sub Online: {final_si_url}", flush=True)
     else:
-        updates['subtitles.sinhala'] = 'not_found'
+        # Mark as 'no_sub_available' so Firestore listeners NEVER loop infinitely on this document!
+        updates['subtitles.sinhala'] = 'no_sub_available'
+        updates['hunt_status'] = 'no_sub_available'
         push_missing_sub_alert(rtdb, anime_id, ep_title, ep_num, rpm_id, server)
-        print(f"[{WORKER_ID}] ⚠️ Hunt FAILED. Alert logged to Admin Panel.", flush=True)
+        print(f"[{WORKER_ID}] ⚠️ Hunt COMPLETED: No subtitle available on RPM. Marked 'no_sub_available'.", flush=True)
 
     if final_en_url:
         updates['subtitles.english'] = final_en_url
 
     ep_ref.update(updates)
+    try:
+        rtdb.reference(f"sub_manager_jobs/completed_jobs/{job_id}").set({
+            "status": "completed",
+            "result": "success" if final_si_url else "no_sub_available",
+            "ep_path": ep_path,
+            "timestamp": int(time.time() * 1000)
+        })
+    except Exception: pass
     return bool(final_si_url)
 
 def main():
