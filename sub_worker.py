@@ -59,9 +59,24 @@ load_dotenv()
 
 WORKER_ID = f"CloudSub-{uuid.uuid4().hex[:6]}"
 RPM_BASE_URL = "https://rpmshare.com/api/v1"
-RPM_API_TOKEN = os.getenv("RPMSHARE_API_TOKEN", "")
-RPM_API_TOKEN_2 = os.getenv("RPMSHARE_API_TOKEN_2", "")
+RPM_API_TOKEN = os.getenv("RPMSHARE_API_TOKEN", "").strip().strip("'\"")
+RPM_API_TOKEN_2 = os.getenv("RPMSHARE_API_TOKEN_2", "").strip().strip("'\"")
 FIREBASE_DB_URL = os.getenv("FIREBASE_DB_URL", "https://anishift-5d14b-default-rtdb.firebaseio.com/")
+
+def get_rpm_tokens(preferred_token=None):
+    tokens = []
+    if preferred_token and str(preferred_token).strip():
+        cp = str(preferred_token).strip().strip("'\"")
+        if cp: tokens.append(cp)
+    for t in [
+        os.getenv("RPMSHARE_API_TOKEN_2", "").strip().strip("'\""),
+        os.getenv("RPMSHARE_API_TOKEN", "").strip().strip("'\""),
+        RPM_API_TOKEN_2,
+        RPM_API_TOKEN
+    ]:
+        if t and t not in tokens:
+            tokens.append(t)
+    return tokens
 
 def init_firebase():
     key_path = "serviceAccountKey.json" if os.path.exists("serviceAccountKey.json") else os.path.join("..", "serviceAccountKey.json")
@@ -77,201 +92,231 @@ def init_firebase():
         firebase_admin.initialize_app(cred, {'databaseURL': FIREBASE_DB_URL})
     return firestore.client()
 
-def download_rpm_sub_api(video_id, api_token=RPM_API_TOKEN, work_dir="."):
+def download_rpm_sub_api(video_id, api_token=None, work_dir=".", return_token=False):
     print(f"[{WORKER_ID}] 📥 Extracting Sub from RPM Video: {video_id}", flush=True)
-    headers = {'api-token': api_token}
-    target_host = "https://rpmshare.com"
+    all_tokens = get_rpm_tokens(api_token)
 
-    try:
-        player_resp = requests.get(f"{RPM_BASE_URL}/video/player/default", headers=headers, timeout=10)
-        if player_resp.status_code == 200:
-            p_dom = player_resp.json().get('domain')
-            if p_dom:
-                target_host = f"https://{p_dom}" if not p_dom.startswith("http") else p_dom
-    except Exception:
-        pass
+    for token_idx, cur_token in enumerate(all_tokens, 1):
+        tok_tag = f"...{cur_token[-6:]}" if len(cur_token) >= 6 else f"token_{token_idx}"
+        headers = {'api-token': cur_token}
+        target_host = "https://rpmshare.com"
 
-    for _ in range(5):
         try:
-            files_resp = requests.get(f"{RPM_BASE_URL}/video/manage/{video_id}/files", headers=headers, timeout=20)
-            if files_resp.status_code == 200:
-                files = files_resp.json()
-                candidates = [f for f in files if f.get('type') == 'Subtitle' and f.get('language') != 'si']
-
-                if candidates:
-                    en_candidates = [c for c in candidates if c.get('language') == 'en' or 'eng' in c.get('name', '').lower()]
-                    other_candidates = [c for c in candidates if c not in en_candidates]
-                    sorted_candidates = en_candidates + other_candidates
-
-                    valid_subs_data = []
-                    print(f"[{WORKER_ID}] 🔍 Analyzing {len(sorted_candidates)} subtitle tracks...", flush=True)
-
-                    for c in sorted_candidates:
-                        try:
-                            dl_resp = requests.get(f"{target_host}{c['url']}", timeout=30)
-                            if dl_resp.status_code == 200:
-                                ext = c.get('extension', 'srt')
-                                temp_path = os.path.join(work_dir, f"temp_check_{uuid.uuid4().hex[:6]}.{ext}")
-                                with open(temp_path, "wb") as f:
-                                    f.write(dl_resp.content)
-
-                                if not is_valid_sub_file(temp_path):
-                                    if os.path.exists(temp_path): os.remove(temp_path)
-                                    continue
-
-                                enc = detect_encoding(temp_path)
-                                try: subs = pysubs2.load(temp_path, encoding=enc)
-                                except Exception: subs = pysubs2.load(temp_path, encoding='latin-1')
-
-                                line_count = len(subs.events)
-                                sub_lang = c.get('language', '').lower()
-
-                                if line_count >= MIN_SUB_LINE_THRESHOLD:
-                                    valid_subs_data.append({
-                                        'path': temp_path,
-                                        'lines': line_count,
-                                        'lang': sub_lang,
-                                        'is_en': (sub_lang == 'en' or 'eng' in c.get('name', '').lower())
-                                    })
-                                else:
-                                    if os.path.exists(temp_path): os.remove(temp_path)
-                        except Exception:
-                            pass
-
-                    if valid_subs_data:
-                        valid_subs_data.sort(key=lambda x: (1 if x['is_en'] else 0, x['lines']), reverse=True)
-                        winner = valid_subs_data[0]
-                        print(f"[{WORKER_ID}] 🏆 WINNER: '{winner['lang']}' with {winner['lines']} lines!", flush=True)
-
-                        for item in valid_subs_data[1:]:
-                            if os.path.exists(item['path']):
-                                try: os.remove(item['path'])
-                                except Exception: pass
-                        return winner['path']
+            player_resp = requests.get(f"{RPM_BASE_URL}/video/player/default", headers=headers, timeout=10)
+            if player_resp.status_code == 200:
+                p_dom = player_resp.json().get('domain')
+                if p_dom:
+                    target_host = f"https://{p_dom}" if not p_dom.startswith("http") else p_dom
         except Exception:
             pass
-        time.sleep(2)
+
+        for attempt in range(3):
+            try:
+                files_resp = requests.get(f"{RPM_BASE_URL}/video/manage/{video_id}/files", headers=headers, timeout=20)
+                if files_resp.status_code != 200:
+                    # Token does not own this video
+                    break
+                files = files_resp.json()
+                if not isinstance(files, list) or len(files) == 0:
+                    break
+
+                candidates = [f for f in files if f.get('type') == 'Subtitle' and f.get('language') != 'si']
+                if not candidates:
+                    break
+
+                en_candidates = [c for c in candidates if c.get('language') == 'en' or 'eng' in c.get('name', '').lower()]
+                other_candidates = [c for c in candidates if c not in en_candidates]
+                sorted_candidates = en_candidates + other_candidates
+
+                valid_subs_data = []
+                print(f"[{WORKER_ID}] 🔍 Analyzing {len(sorted_candidates)} subtitle tracks (Token {tok_tag})...", flush=True)
+
+                for c in sorted_candidates:
+                    try:
+                        dl_resp = requests.get(f"{target_host}{c['url']}", timeout=30)
+                        if dl_resp.status_code == 200:
+                            ext = c.get('extension', 'srt')
+                            temp_path = os.path.join(work_dir, f"temp_check_{uuid.uuid4().hex[:6]}.{ext}")
+                            with open(temp_path, "wb") as f:
+                                f.write(dl_resp.content)
+
+                            if not is_valid_sub_file(temp_path):
+                                if os.path.exists(temp_path): os.remove(temp_path)
+                                continue
+
+                            enc = detect_encoding(temp_path)
+                            try: subs = pysubs2.load(temp_path, encoding=enc)
+                            except Exception: subs = pysubs2.load(temp_path, encoding='latin-1')
+
+                            line_count = len(subs.events)
+                            sub_lang = c.get('language', '').lower()
+
+                            if line_count >= MIN_SUB_LINE_THRESHOLD:
+                                valid_subs_data.append({
+                                    'path': temp_path,
+                                    'lines': line_count,
+                                    'lang': sub_lang,
+                                    'is_en': (sub_lang == 'en' or 'eng' in c.get('name', '').lower())
+                                })
+                            else:
+                                if os.path.exists(temp_path): os.remove(temp_path)
+                    except Exception:
+                        pass
+
+                if valid_subs_data:
+                    valid_subs_data.sort(key=lambda x: (1 if x['is_en'] else 0, x['lines']), reverse=True)
+                    winner = valid_subs_data[0]
+                    print(f"[{WORKER_ID}] 🏆 WINNER: '{winner['lang']}' with {winner['lines']} lines (via {tok_tag})!", flush=True)
+
+                    for item in valid_subs_data[1:]:
+                        if os.path.exists(item['path']):
+                            try: os.remove(item['path'])
+                            except Exception: pass
+
+                    if return_token:
+                        return winner['path'], cur_token
+                    return winner['path']
+            except Exception:
+                pass
+            time.sleep(1)
+
+    if return_token:
+        return None, None
     return None
 
-def fetch_dual_subs_from_rpm(video_id, api_token, work_dir="."):
-    headers = {'api-token': api_token}
-    target_host = "https://rpmshare.com"
+def fetch_dual_subs_from_rpm(video_id, api_token=None, work_dir=".", return_token=False):
+    all_tokens = get_rpm_tokens(api_token)
 
-    try:
-        player_resp = requests.get(f"{RPM_BASE_URL}/video/player/default", headers=headers, timeout=10)
-        if player_resp.status_code == 200:
-            p_dom = player_resp.json().get('domain')
-            if p_dom:
-                target_host = f"https://{p_dom}" if not p_dom.startswith("http") else p_dom
-    except Exception:
-        pass
+    for token_idx, cur_token in enumerate(all_tokens, 1):
+        tok_tag = f"...{cur_token[-6:]}" if len(cur_token) >= 6 else f"token_{token_idx}"
+        headers = {'api-token': cur_token}
+        target_host = "https://rpmshare.com"
 
-    try:
-        files_resp = requests.get(f"{RPM_BASE_URL}/video/manage/{video_id}/files", headers=headers, timeout=15)
-        if files_resp.status_code != 200:
-            return None, None
+        try:
+            player_resp = requests.get(f"{RPM_BASE_URL}/video/player/default", headers=headers, timeout=10)
+            if player_resp.status_code == 200:
+                p_dom = player_resp.json().get('domain')
+                if p_dom:
+                    target_host = f"https://{p_dom}" if not p_dom.startswith("http") else p_dom
+        except Exception:
+            pass
 
-        files = files_resp.json()
-        sub_files = [f for f in files if f.get('type') == 'Subtitle']
-        if not sub_files:
-            return None, None
+        try:
+            files_resp = requests.get(f"{RPM_BASE_URL}/video/manage/{video_id}/files", headers=headers, timeout=15)
+            if files_resp.status_code != 200:
+                continue
 
-        print(f"[{WORKER_ID}] 🔍 Analyzing {len(sub_files)} subtitle tracks from RPM...", flush=True)
-        si_candidates = []
-        other_candidates = []
+            files = files_resp.json()
+            if not isinstance(files, list):
+                continue
 
-        for sf in sub_files:
-            url = f"{target_host}{sf.get('url')}"
-            name = sf.get('name', 'Unnamed')
-            name_lower = name.lower()
-            lang = sf.get('language', '').lower()
-            ext = sf.get('extension', 'srt')
-            tmp = os.path.join(work_dir, f"dual_sub_{uuid.uuid4().hex[:6]}.{ext}")
+            sub_files = [f for f in files if f.get('type') == 'Subtitle']
+            if not sub_files:
+                continue
 
-            try:
-                dl = requests.get(url, timeout=20)
-                if dl.status_code != 200:
+            print(f"[{WORKER_ID}] 🔍 Analyzing {len(sub_files)} subtitle tracks from RPM (Token {tok_tag})...", flush=True)
+            si_candidates = []
+            other_candidates = []
+
+            for sf in sub_files:
+                url = f"{target_host}{sf.get('url')}"
+                name = sf.get('name', 'Unnamed')
+                name_lower = name.lower()
+                lang = sf.get('language', '').lower()
+                ext = sf.get('extension', 'srt')
+                tmp = os.path.join(work_dir, f"dual_sub_{uuid.uuid4().hex[:6]}.{ext}")
+
+                try:
+                    dl = requests.get(url, timeout=20)
+                    if dl.status_code != 200:
+                        continue
+                    with open(tmp, 'wb') as f:
+                        f.write(dl.content)
+                except Exception:
                     continue
-                with open(tmp, 'wb') as f:
-                    f.write(dl.content)
-            except Exception:
-                continue
 
-            if not is_valid_sub_file(tmp):
-                if os.path.exists(tmp): os.remove(tmp)
-                continue
-
-            try:
-                enc = detect_encoding(tmp)
-                try: sub_obj = pysubs2.load(tmp, encoding=enc)
-                except Exception: sub_obj = pysubs2.load(tmp, encoding='latin-1')
-
-                lines = len(sub_obj.events)
-
-                # --- 🟢 125-Line Threshold & Subtitle Scoring Logic ---
-                score = lines
-                if lines >= MIN_SUB_LINE_THRESHOLD:
-                    if any(x in name_lower for x in ['si', 'sinhala', 'සිංහල']) or lang == 'si':
-                        score += 200000
-                    elif any(x in name_lower for x in ['en', 'eng', 'english']) or lang == 'en':
-                        score += 100000
-                    elif any(x in name_lower for x in ['ja', 'jap', 'romaji']) or lang == 'ja':
-                        score -= 100000
-                    else:
-                        score += 10000  # Valid other language (e.g. French, Spanish, Track 1)
-                else:
-                    score -= 50000  # Penalize cracked/incomplete tracks
-
-                print(f"[{WORKER_ID}]    📄 Track '{name}' | Lang: {lang or 'N/A'} | Lines: {lines} | Score: {score}", flush=True)
-
-                if score <= 0:
+                if not is_valid_sub_file(tmp):
                     if os.path.exists(tmp): os.remove(tmp)
                     continue
 
-                track_info = {
-                    'path': tmp,
-                    'lines': lines,
-                    'score': score,
-                    'name': name,
-                    'lang': lang
-                }
+                try:
+                    enc = detect_encoding(tmp)
+                    try: sub_obj = pysubs2.load(tmp, encoding=enc)
+                    except Exception: sub_obj = pysubs2.load(tmp, encoding='latin-1')
 
-                if any(x in name_lower for x in ['si', 'sinhala', 'සිංහල']) or lang == 'si':
-                    si_candidates.append(track_info)
-                else:
-                    other_candidates.append(track_info)
+                    lines = len(sub_obj.events)
 
-            except Exception:
-                if os.path.exists(tmp):
-                    try: os.remove(tmp)
-                    except Exception: pass
+                    # --- 🟢 125-Line Threshold & Subtitle Scoring Logic ---
+                    score = lines
+                    if lines >= MIN_SUB_LINE_THRESHOLD:
+                        if any(x in name_lower for x in ['si', 'sinhala', 'සිංහල']) or lang == 'si':
+                            score += 200000
+                        elif any(x in name_lower for x in ['en', 'eng', 'english']) or lang == 'en':
+                            score += 100000
+                        elif any(x in name_lower for x in ['ja', 'jap', 'romaji']) or lang == 'ja':
+                            score -= 100000
+                        else:
+                            score += 10000
+                    else:
+                        score -= 50000
 
-        winner_si_path = None
-        if si_candidates:
-            si_candidates.sort(key=lambda x: x['score'], reverse=True)
-            winner_si = si_candidates[0]
-            winner_si_path = winner_si['path']
-            print(f"[{WORKER_ID}] 🏆 WINNER SINHALA: '{winner_si['name']}' ({winner_si['lines']} lines, Score: {winner_si['score']})", flush=True)
-            for c in si_candidates[1:]:
-                if os.path.exists(c['path']):
-                    try: os.remove(c['path'])
-                    except Exception: pass
+                    print(f"[{WORKER_ID}]    📄 Track '{name}' | Lang: {lang or 'N/A'} | Lines: {lines} | Score: {score}", flush=True)
 
-        winner_cand_path = None
-        if other_candidates:
-            other_candidates.sort(key=lambda x: x['score'], reverse=True)
-            winner_cand = other_candidates[0]
-            winner_cand_path = winner_cand['path']
-            print(f"[{WORKER_ID}] 🏆 WINNER TRANSLATION SOURCE: '{winner_cand['name']}' ({winner_cand['lines']} lines, Score: {winner_cand['score']})", flush=True)
-            for c in other_candidates[1:]:
-                if os.path.exists(c['path']):
-                    try: os.remove(c['path'])
-                    except Exception: pass
+                    if score <= 0:
+                        if os.path.exists(tmp): os.remove(tmp)
+                        continue
 
-        return winner_si_path, winner_cand_path
-    except Exception as e:
-        print(f"[{WORKER_ID}] ❌ Error fetching dual RPM subs: {e}", flush=True)
-        return None, None
+                    track_info = {
+                        'path': tmp,
+                        'lines': lines,
+                        'score': score,
+                        'name': name,
+                        'lang': lang
+                    }
+
+                    if any(x in name_lower for x in ['si', 'sinhala', 'සිංහල']) or lang == 'si':
+                        si_candidates.append(track_info)
+                    else:
+                        other_candidates.append(track_info)
+
+                except Exception:
+                    if os.path.exists(tmp):
+                        try: os.remove(tmp)
+                        except Exception: pass
+
+            winner_si_path = None
+            if si_candidates:
+                si_candidates.sort(key=lambda x: x['score'], reverse=True)
+                winner_si = si_candidates[0]
+                winner_si_path = winner_si['path']
+                print(f"[{WORKER_ID}] 🏆 WINNER SINHALA: '{winner_si['name']}' ({winner_si['lines']} lines, Score: {winner_si['score']})", flush=True)
+                for c in si_candidates[1:]:
+                    if os.path.exists(c['path']):
+                        try: os.remove(c['path'])
+                        except Exception: pass
+
+            winner_cand_path = None
+            if other_candidates:
+                other_candidates.sort(key=lambda x: x['score'], reverse=True)
+                winner_cand = other_candidates[0]
+                winner_cand_path = winner_cand['path']
+                print(f"[{WORKER_ID}] 🏆 WINNER TRANSLATION SOURCE: '{winner_cand['name']}' ({winner_cand['lines']} lines, Score: {winner_cand['score']})", flush=True)
+                for c in other_candidates[1:]:
+                    if os.path.exists(c['path']):
+                        try: os.remove(c['path'])
+                        except Exception: pass
+
+            if winner_si_path or winner_cand_path:
+                if return_token:
+                    return winner_si_path, winner_cand_path, cur_token
+                return winner_si_path, winner_cand_path
+
+        except Exception as e:
+            print(f"[{WORKER_ID}] ❌ Error fetching dual RPM subs with {tok_tag}: {e}", flush=True)
+
+    if return_token:
+        return None, None, None
+    return None, None
 
 def execute_report_job(db, payload, work_dir):
     ep_path = payload.get("episode_path")
@@ -297,13 +342,18 @@ def execute_report_job(db, payload, work_dir):
         return False
 
     server = data.get('server', 1)
-    token = RPM_API_TOKEN_2 if server == 2 else RPM_API_TOKEN
+    preferred_token = RPM_API_TOKEN_2 if str(server) == "2" else RPM_API_TOKEN
     series_ref = ep_ref.parent.parent if ep_ref.parent else None
     anime_id = series_ref.id if series_ref else data.get('anilist_id', 0)
     ep_num = data.get('episodeNumber', 1)
 
     job_id = payload.get("job_id") or f"report_{payload.get('doc_id')}"
-    sub_file = download_rpm_sub_api(rpm_id, api_token=token, work_dir=work_dir)
+    sub_res = download_rpm_sub_api(rpm_id, api_token=preferred_token, work_dir=work_dir, return_token=True)
+    if isinstance(sub_res, tuple):
+        sub_file, working_token = sub_res
+    else:
+        sub_file, working_token = sub_res, preferred_token
+
     if not sub_file:
         print(f"[{WORKER_ID}] ⚠️ No valid subtitle file in video {rpm_id}", flush=True)
         ep_ref.update({'report_status': 'failed_no_sub_in_video', 'worker_id': None})
@@ -317,6 +367,9 @@ def execute_report_job(db, payload, work_dir):
         except Exception: pass
         return False
 
+    active_token = working_token or preferred_token
+    determined_server = 2 if (active_token and RPM_API_TOKEN_2 and active_token == RPM_API_TOKEN_2) else 1
+
     rel_ctx = {}
     out_en = os.path.join(work_dir, f"english_sub_{uuid.uuid4().hex[:4]}.srt")
     out_si = os.path.join(work_dir, f"sinhala_sub_{uuid.uuid4().hex[:4]}.srt")
@@ -329,8 +382,8 @@ def execute_report_job(db, payload, work_dir):
 
     if sin_sub:
         github_si = upload_to_github_release(sin_sub, asset_name="Sinhala.srt", release_context=rel_ctx)
-        delete_existing_sinhala_subs(rpm_id, api_token=token)
-        upload_sub_to_rpm(rpm_id, sin_sub, api_token=token, remote_url=github_si)
+        delete_existing_sinhala_subs(rpm_id, api_token=active_token)
+        upload_sub_to_rpm(rpm_id, sin_sub, api_token=active_token, remote_url=github_si)
 
     if github_si:
         ep_ref.update({
@@ -339,7 +392,8 @@ def execute_report_job(db, payload, work_dir):
             'subtitles.sinhala': github_si,
             'subtitles.english': github_en if github_en else 'not_found',
             'last_fixed': firestore.SERVER_TIMESTAMP,
-            'worker_id': None
+            'worker_id': None,
+            'server': determined_server
         })
         clear_missing_sub_alert(rtdb, anime_id, ep_num)
         print(f"[{WORKER_ID}] ✅ SUCCESS! Report Fixed. SI: {github_si} | EN: {github_en}", flush=True)
@@ -375,7 +429,7 @@ def execute_hunt_job(db, payload, work_dir):
     data = snap.to_dict() or {}
     rpm_id = data.get('links', {}).get('rpm_video_id')
     server = data.get('server', 1)
-    token = RPM_API_TOKEN_2 if server == 2 else RPM_API_TOKEN
+    preferred_token = RPM_API_TOKEN_2 if str(server) == "2" else RPM_API_TOKEN
 
     if not rpm_id:
         stream_url = data.get('links', {}).get('rpm_stream') or data.get('links', {}).get('rpm_download') or ""
@@ -397,7 +451,16 @@ def execute_hunt_job(db, payload, work_dir):
     ep_ref.update({'subtitles.sinhala': 'processing_cloud'})
     print(f"[{WORKER_ID}] 🚀 Starting Hunt: {ep_title} (Ep {ep_num})", flush=True)
 
-    si_path, en_path = fetch_dual_subs_from_rpm(rpm_id, token, work_dir=work_dir)
+    dual_res = fetch_dual_subs_from_rpm(rpm_id, preferred_token, work_dir=work_dir, return_token=True)
+    if isinstance(dual_res, tuple) and len(dual_res) == 3:
+        si_path, en_path, working_token = dual_res
+    else:
+        si_path, en_path = dual_res
+        working_token = preferred_token
+
+    active_token = working_token or preferred_token
+    determined_server = 2 if (active_token and RPM_API_TOKEN_2 and active_token == RPM_API_TOKEN_2) else 1
+
     final_si_url = None
     final_en_url = None
     rel_ctx = {}
@@ -418,8 +481,8 @@ def execute_hunt_job(db, payload, work_dir):
             )
             if si_gen_path:
                 final_si_url = upload_to_github_release(si_gen_path, asset_name="Sinhala.srt", release_context=rel_ctx)
-                delete_existing_sinhala_subs(rpm_id, token)
-                upload_sub_to_rpm(rpm_id, si_gen_path, token, remote_url=final_si_url)
+                delete_existing_sinhala_subs(rpm_id, active_token)
+                upload_sub_to_rpm(rpm_id, si_gen_path, active_token, remote_url=final_si_url)
 
     if si_path:
         print(f"[{WORKER_ID}] ⭐ Direct Sinhala Sub Found on RPM!", flush=True)
@@ -431,11 +494,11 @@ def execute_hunt_job(db, payload, work_dir):
         )
         target_si = si_clean_path if si_clean_path else si_path
         final_si_url = upload_to_github_release(target_si, asset_name="Sinhala.srt", release_context=rel_ctx)
-        delete_existing_sinhala_subs(rpm_id, token)
-        upload_sub_to_rpm(rpm_id, target_si, token, remote_url=final_si_url)
+        delete_existing_sinhala_subs(rpm_id, active_token)
+        upload_sub_to_rpm(rpm_id, target_si, active_token, remote_url=final_si_url)
 
     job_id = payload.get("job_id") or f"hunt_{payload.get('doc_id')}"
-    updates = {'last_auto_update': firestore.SERVER_TIMESTAMP}
+    updates = {'last_auto_update': firestore.SERVER_TIMESTAMP, 'server': determined_server}
     if final_si_url:
         updates['subtitles.sinhala'] = final_si_url
         updates['status'] = 'uploaded'
